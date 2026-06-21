@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+venv/
+ENV/
+env/
+
+# Config secrets
+.env
+credentials.json
+token.json
+
+# Logs & temp storage
+*.log
+storage/raw/*.mp4
+storage/metadata/*.json
+storage/temp_download/
+storage/ffmpeg.log
+storage/nvr.log
+yolov8n.pt
