@@ -16,21 +16,40 @@ from gdrive_uploader import upload_file_to_drive
 # Load config
 load_dotenv()
 
+import fcntl
+# Acquire exclusive process lock to prevent concurrent execution
+os.makedirs("storage", exist_ok=True)
+lock_file = open("storage/nvr.lock", "w")
+try:
+    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except IOError:
+    print("CRITICAL: Another instance of NVR is already running. Exiting.", file=sys.stderr)
+    sys.exit(1)
+
+
 RTSP_URL = os.getenv("RTSP_URL")
 CHUNK_TIME = os.getenv("CHUNK_DURATION_SECONDS", "240")
 ENABLE_ML = os.getenv("ENABLE_ML", "False").lower() == "true"
 RAW_DIR = "storage/raw"
 LOG_DIR = "storage"
-LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "WARNING").upper()
+if LOG_LEVEL_STR == "WARN":
+    LOG_LEVEL_STR = "WARNING"
 
 # Ensure directories exist
 os.makedirs(RAW_DIR, exist_ok=True)
 os.makedirs("storage/metadata", exist_ok=True)
 
 # Set up Production logging with Rotation
-log_level = getattr(logging, LOG_LEVEL_STR, logging.INFO)
+log_level = getattr(logging, LOG_LEVEL_STR, logging.WARNING)
 logger = logging.getLogger("nvr")
 logger.setLevel(log_level)
+
+# Silence third-party library loggers
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("googleapiclient").setLevel(logging.WARNING)
+logging.getLogger("google.auth").setLevel(logging.WARNING)
+logging.getLogger("ultralytics").setLevel(logging.WARNING)
 
 formatter = logging.Formatter('%(asctime)s [%(levelname)s] (%(name)s) %(message)s')
 
@@ -66,13 +85,12 @@ def ml_worker():
             logger.info(f"ML worker received segment: {video_path}")
             metadata_path = None
             
-            if ENABLE_ML:
-                try:
-                    metadata_path = analyze_video(video_path)
-                except Exception as e:
-                    logger.error(f"Uncaught error in ML analysis for {video_path}: {e}", exc_info=True)
+            try:
+                metadata_path = analyze_video(video_path, run_ml=ENABLE_ML)
+            except Exception as e:
+                logger.error(f"Uncaught error in video analysis for {video_path}: {e}", exc_info=True)
             
-            # Pass on to the upload queue even if ML failed/skipped
+            # Pass on to the upload queue even if analysis failed/skipped
             upload_queue.put((video_path, metadata_path))
             ml_queue.task_done()
         except Exception:
@@ -146,6 +164,7 @@ def start_rtsp_slicer():
 
     cmd = [
         'ffmpeg', '-y',
+        '-loglevel', 'warning',
         '-rtsp_transport', 'tcp',
         '-i', RTSP_URL,
         '-c', 'copy',

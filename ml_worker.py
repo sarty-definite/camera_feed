@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import cv2
+import torch
 from ultralytics import YOLO
 from dotenv import load_dotenv
 
@@ -18,6 +19,8 @@ except Exception as e:
     logger.critical(f"Failed to load YOLO model: {e}", exc_info=True)
     raise
 
+from timestamp_detector import detect_timestamps
+
 # COCO Dataset index map targets we want to catch (Person=0)
 # Custom classes can be supplied via YOLO_TARGET_CLASSES env variable
 target_classes_str = os.getenv("YOLO_TARGET_CLASSES", "0")
@@ -28,61 +31,79 @@ except ValueError:
     logger.warning("Failed to parse YOLO_TARGET_CLASSES from environment. Defaulting to Person [0].")
     TARGET_CLASSES = [0]
 
-def analyze_video(video_path):
-    """Processes a video block frame-by-frame using efficient keyframe grabbing and YOLO analysis."""
-    logger.info(f"Starting ML analysis on video segment: {os.path.basename(video_path)}")
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        logger.error(f"Failed to open video file for ML analysis: {video_path}")
-        return None
-
+def analyze_video(video_path, run_ml=True):
+    """Processes a video block to detect first/last frame timestamps, duration, and optionally runs YOLO analysis."""
     base_name = os.path.basename(video_path).replace(".mp4", "")
-    metadata_path = f"storage/metadata/{base_name}_events.json"
+    logger.info(f"Starting analysis on video segment: {base_name} (ML enabled: {run_ml})")
     
-    frame_idx = 0
-    events_found = []
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-
+    # 1. Detect overlay timestamps and duration
+    metadata = {
+        "video_source": base_name,
+        "first_frame_timestamp": None,
+        "last_frame_timestamp": None,
+        "duration_seconds": None
+    }
     try:
-        while cap.isOpened():
-            if frame_idx % SAMPLE_RATE == 0:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                    
-                results = model(frame, verbose=False)[0]
-                
-                for box in results.boxes:
-                    class_id = int(box.cls[0])
-                    if class_id in TARGET_CLASSES:
-                        timestamp_sec = round(frame_idx / fps, 2)
-                        event = {
-                            "class": results.names[class_id],
-                            "confidence": float(box.conf[0]),
-                            "timestamp_offset_sec": timestamp_sec
-                        }
-                        events_found.append(event)
-                        logger.debug(f"Detected target event: {event}")
-                        break  # One event per keyframe slice is enough to log context
-            else:
-                ret = cap.grab()
-                if not ret:
-                    break
-                    
-            frame_idx += 1
+        ts_info = detect_timestamps(video_path)
+        metadata.update(ts_info)
     except Exception as e:
-        logger.error(f"Error occurred during frame analysis loop of {base_name}: {e}", exc_info=True)
-    finally:
-        cap.release()
-    
+        logger.error(f"Error occurred during timestamp detection for {base_name}: {e}", exc_info=True)
+
+    # 2. Optionally run ML analysis
+    events_found = []
+    if run_ml:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.error(f"Failed to open video file for ML analysis: {video_path}")
+        else:
+            frame_idx = 0
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            try:
+                while cap.isOpened():
+                    if frame_idx % SAMPLE_RATE == 0:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                            
+                        with torch.no_grad():
+                            results = model(frame, verbose=False)[0]
+                        
+                        for box in results.boxes:
+                            class_id = int(box.cls[0])
+                            if class_id in TARGET_CLASSES:
+                                timestamp_sec = round(frame_idx / fps, 2)
+                                event = {
+                                    "class": results.names[class_id],
+                                    "confidence": float(box.conf[0]),
+                                    "timestamp_offset_sec": timestamp_sec
+                                }
+                                events_found.append(event)
+                                logger.debug(f"Detected target event: {event}")
+                                break  # One event per keyframe slice is enough to log context
+                    else:
+                        ret = cap.grab()
+                        if not ret:
+                            break
+                            
+                    frame_idx += 1
+            except Exception as e:
+                logger.error(f"Error occurred during frame analysis loop of {base_name}: {e}", exc_info=True)
+            finally:
+                cap.release()
+
     if events_found:
-        try:
-            with open(metadata_path, 'w') as f:
-                json.dump({"video_source": base_name, "events": events_found}, f, indent=4)
-            logger.info(f"AI found {len(events_found)} critical triggers inside {base_name}! Metadata saved.")
-            return metadata_path
-        except Exception as e:
-            logger.error(f"Failed to save metadata JSON for {base_name}: {e}", exc_info=True)
-            
-    logger.info(f"ML analysis complete for {base_name} - no critical triggers detected.")
-    return None
+        metadata["events"] = events_found
+        logger.info(f"AI found {len(events_found)} critical triggers inside {base_name}!")
+    else:
+        logger.info(f"ML analysis complete for {base_name} - no critical triggers detected or ML disabled.")
+
+    # 3. Always save consolidated metadata JSON
+    metadata_path = f"storage/metadata/{base_name}_metadata.json"
+    try:
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=4)
+        logger.info(f"Metadata file successfully saved to {metadata_path}")
+        return metadata_path
+    except Exception as e:
+        logger.error(f"Failed to save metadata JSON for {base_name}: {e}", exc_info=True)
+        return None

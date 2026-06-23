@@ -16,8 +16,14 @@ SCOPES = ['https://www.googleapis.com/auth/drive.file']
 ROOT_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 MAX_STORAGE_BYTES = 64 * 1024 * 1024 * 1024  # Strict 64 GB limit
 
+_service_cache = None
+
 def get_gdrive_service():
     """Initializes and returns Google Drive API service using authorization tokens."""
+    global _service_cache
+    if _service_cache is not None:
+        return _service_cache
+
     creds = None
     if os.path.exists('token.json'):
         try:
@@ -29,7 +35,7 @@ def get_gdrive_service():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
-                logger.info("Credentials expired. Attempting refresh token...")
+                logger.debug("Credentials expired. Attempting refresh token...")
                 creds.refresh(Request())
             except Exception as e:
                 logger.error(f"Failed to refresh credential token: {e}. Re-triggering authorization flow...")
@@ -46,11 +52,12 @@ def get_gdrive_service():
         try:
             with open('token.json', 'w') as token:
                 token.write(creds.to_json())
-            logger.info("Saved fresh authorized session to token.json.")
+            logger.debug("Saved fresh authorized session to token.json.")
         except Exception as e:
             logger.error(f"Failed to write fresh token.json file: {e}")
 
-    return build('drive', 'v3', credentials=creds)
+    _service_cache = build('drive', 'v3', credentials=creds)
+    return _service_cache
 
 def get_or_create_subfolder(service, parent_id, folder_name):
     """Finds or builds a folder layer to guarantee strict YYYY/MM/DD/HH structures."""
@@ -99,7 +106,7 @@ def resolve_hourly_path(service):
 
 def prune_storage_if_full(service):
     """Enforces strict 64GB boundary by dropping oldest objects and cleaning dead structures."""
-    logger.info("Reviewing Google Drive storage quota boundaries...")
+    logger.debug("Reviewing Google Drive storage quota boundaries...")
     
     query = f"mimeType != 'application/vnd.google-apps.folder' and trashed = false"
     files = []
@@ -123,7 +130,7 @@ def prune_storage_if_full(service):
         return
         
     total_size = sum(int(f.get('size', 0)) for f in files)
-    logger.info(f"Current cloud storage utilization: {total_size / (1024**3):.2f} GB / {MAX_STORAGE_BYTES / (1024**3):.2f} GB limit.")
+    logger.debug(f"Current cloud storage utilization: {total_size / (1024**3):.2f} GB / {MAX_STORAGE_BYTES / (1024**3):.2f} GB limit.")
     
     if total_size < MAX_STORAGE_BYTES:
         return
@@ -142,14 +149,14 @@ def prune_storage_if_full(service):
         try:
             service.files().delete(fileId=file_id).execute()
             total_size -= file_size
-            logger.info(f"Deleted legacy cloud node: {oldest_file['name']} ({file_size / (1024**2):.2f} MB)")
+            logger.debug(f"Deleted legacy cloud node: {oldest_file['name']} ({file_size / (1024**2):.2f} MB)")
             
             # Wipe out empty parent folders if all child files are gone
             if parent_id:
                 siblings = service.files().list(q=f"'{parent_id}' in parents and trashed = false", fields="files(id)").execute()
                 if not siblings.get('files', []):
                     service.files().delete(fileId=parent_id).execute()
-                    logger.info("Removed empty hourly directory wrapper.")
+                    logger.debug("Removed empty hourly directory wrapper.")
         except Exception as e:
             logger.error(f"Error purging file {file_id} ({oldest_file['name']}): {e}", exc_info=True)
 
@@ -173,7 +180,6 @@ def upload_file_to_drive(video_path, metadata_path=None):
         for attempt in range(3):
             try:
                 uploaded_video = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-                logger.info(f"Pushed video to cloud grid -> ID: {uploaded_video.get('id')}")
                 break
             except Exception as e:
                 logger.warning(f"Failed video upload (Attempt {attempt+1}/3): {e}")
@@ -187,21 +193,31 @@ def upload_file_to_drive(video_path, metadata_path=None):
         uploaded_meta_success = False
         if metadata_path and os.path.exists(metadata_path):
             meta_metadata = {'name': os.path.basename(metadata_path), 'parents': [target_folder_id]}
-            media_meta = MediaFileUpload(metadata_path, mimetype='application/json')
             
             for attempt in range(3):
                 try:
+                    media_meta = MediaFileUpload(metadata_path, mimetype='application/json')
                     service.files().create(body=meta_metadata, media_body=media_meta).execute()
-                    logger.info(f"Pushed AI events metadata to cloud -> {os.path.basename(metadata_path)}")
                     uploaded_meta_success = True
+                    del media_meta
                     break
                 except Exception as e:
                     logger.warning(f"Failed metadata upload (Attempt {attempt+1}/3): {e}")
                     time.sleep(2 * (attempt + 1))
-            del media_meta
+
+        # Log a single info line with filename, time, and metadata filename if applicable
+        upload_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        vname = os.path.basename(video_path)
+        if uploaded_meta_success and metadata_path:
+            mname = os.path.basename(metadata_path)
+            logger.info(f"Uploaded {vname} (with metadata {mname}) to Google Drive at {upload_time}")
+        else:
+            logger.info(f"Uploaded {vname} to Google Drive at {upload_time}")
 
     except Exception as e:
         logger.error(f"Upload exception encountered: {e}", exc_info=True)
+        global _service_cache
+        _service_cache = None
         return
         
     # Local cleanups
