@@ -4,6 +4,10 @@ import re
 import logging
 from datetime import datetime
 import os
+import warnings
+
+# Suppress PyTorch user warnings about pin_memory or other non-critical accelerator warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torch")
 
 logger = logging.getLogger("nvr.timestamp_detector")
 
@@ -14,10 +18,9 @@ def get_reader():
     global _reader
     if _reader is None:
         logger.info("Initializing EasyOCR reader (CPU mode)...")
-        # EasyOCR defaults to checking GPU, we force gpu=False for predictable CPU usage
-        # or use GPU if cuda is installed. Let's use GPU if cuda is available, else CPU.
-        # But to be safe, gpu=False is extremely reliable on standard servers.
-        _reader = easyocr.Reader(['en'], gpu=False)
+        # EasyOCR defaults to checking GPU, we force gpu=False for predictable CPU usage.
+        # verbose=False suppresses the initialization prints to stdout.
+        _reader = easyocr.Reader(['en'], gpu=False, verbose=False)
     return _reader
 
 def parse_ocr_text(ocr_results):
@@ -85,28 +88,49 @@ def detect_timestamps(video_path):
         "duration_seconds": float or None
     """
     logger.info(f"Extracting overlay timestamps for: {os.path.basename(video_path)}")
+    
+    if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+        logger.error(f"Video file is missing or empty: {video_path}")
+        return {
+            "first_frame_timestamp": None,
+            "last_frame_timestamp": None,
+            "duration_seconds": None
+        }
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        logger.error(f"Failed to open video file: {video_path}")
+        logger.error(f"Failed to open video file (corrupted): {video_path}")
         return {
             "first_frame_timestamp": None,
             "last_frame_timestamp": None,
             "duration_seconds": None
         }
         
-    first_dt = None
-    last_dt = None
-    duration = None
-    
-    # Get total frames and FPS to estimate duration and locate last frame
+    # Get total frames and FPS to estimate duration and locate frames
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps > 0 and total_frames > 0:
-        duration = round(total_frames / fps, 2)
-        
-    # 1. Read first frame
-    ret, first_frame = cap.read()
-    if ret:
+    
+    if total_frames <= 0 or fps <= 0:
+        logger.error(f"Video file appears to be corrupted (invalid frame count or FPS): {video_path}")
+        cap.release()
+        return {
+            "first_frame_timestamp": None,
+            "last_frame_timestamp": None,
+            "duration_seconds": None
+        }
+
+    duration = round(total_frames / fps, 2)
+    first_dt = None
+    last_dt = None
+    
+    # 1. Read first frame (with fallback: 0, 3, 6, 9, ...)
+    max_first_frame_search = min(total_frames, 90)
+    for idx in range(0, max_first_frame_search, 3):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, first_frame = cap.read()
+        if not ret or first_frame is None:
+            continue
+            
         h, w, _ = first_frame.shape
         crop_h = int(h * 0.1)
         crop_w = int(w * 0.35)
@@ -117,36 +141,38 @@ def detect_timestamps(video_path):
             reader = get_reader()
             with torch.no_grad():
                 results = reader.readtext(crop_first)
-            first_dt = parse_ocr_text(results)
-        except Exception as e:
-            logger.error(f"OCR failed on first frame of {os.path.basename(video_path)}: {e}", exc_info=True)
-
-    # 2. Read last frame
-    if total_frames > 0:
-        # Seek close to the end (e.g. 5 frames before end) to make sure we don't hit EOF prematurely
-        pos = max(0, total_frames - 5)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
-        last_frame = None
-        while True:
-            ret, frame = cap.read()
-            if not ret:
+            dt = parse_ocr_text(results)
+            if dt is not None:
+                first_dt = dt
                 break
-            last_frame = frame
+        except Exception as e:
+            logger.error(f"OCR failed on frame {idx} of {os.path.basename(video_path)}: {e}", exc_info=True)
+
+    # 2. Read last frame (with fallback: pos, pos-3, pos-6, ...)
+    start_pos = max(0, total_frames - 5)
+    min_pos = max(0, start_pos - 90)
+    for idx in range(start_pos, min_pos - 1, -3):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, last_frame = cap.read()
+        if not ret or last_frame is None:
+            continue
             
-        if last_frame is not None:
-            h, w, _ = last_frame.shape
-            crop_h = int(h * 0.1)
-            crop_w = int(w * 0.35)
-            crop_last = last_frame[0:crop_h, (w - crop_w):w]
-            
-            try:
-                import torch
-                reader = get_reader()
-                with torch.no_grad():
-                    results = reader.readtext(crop_last)
-                last_dt = parse_ocr_text(results)
-            except Exception as e:
-                logger.error(f"OCR failed on last frame of {os.path.basename(video_path)}: {e}", exc_info=True)
+        h, w, _ = last_frame.shape
+        crop_h = int(h * 0.1)
+        crop_w = int(w * 0.35)
+        crop_last = last_frame[0:crop_h, (w - crop_w):w]
+        
+        try:
+            import torch
+            reader = get_reader()
+            with torch.no_grad():
+                results = reader.readtext(crop_last)
+            dt = parse_ocr_text(results)
+            if dt is not None:
+                last_dt = dt
+                break
+        except Exception as e:
+            logger.error(f"OCR failed on frame {idx} of {os.path.basename(video_path)}: {e}", exc_info=True)
 
     cap.release()
     
